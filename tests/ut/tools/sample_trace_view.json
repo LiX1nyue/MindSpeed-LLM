@@ -1,0 +1,17 @@
+{
+  "traceEvents": [
+    {"name": "process_name", "cat": "metadata", "ph": "M", "pid": 1, "tid": 0, "args": {"name": "npu"}},
+    {"name": "thread_name", "cat": "metadata", "ph": "M", "pid": 1, "tid": 1, "args": {"name": "cpu"}},
+    {"name": "aten::matmul", "cat": "cpu_op", "ph": "X", "ts": 1000, "dur": 30, "pid": 1, "tid": 1, "args": {"External id": 100}},
+    {"name": "async_npu", "cat": "async", "ph": "s", "id": 500, "ts": 1005, "pid": 1, "tid": 1},
+    {"name": "MatMul", "cat": "Kernel", "ph": "X", "ts": 1010, "dur": 40, "pid": 1, "tid": 7, "args": {"stream": 7, "correlation": 100}},
+    {"name": "async_npu", "cat": "async", "ph": "f", "id": 500, "ts": 1050, "pid": 1, "tid": 7},
+    {"name": "Add", "cat": "Kernel", "ph": "X", "ts": 1060, "dur": 20, "pid": 1, "tid": 7, "args": {"stream": 7}},
+    {"name": "LayerNorm", "cat": "Kernel", "ph": "X", "ts": 1090, "dur": 30, "pid": 1, "tid": 7, "args": {"stream": 7}},
+    {"name": "hcom_allReduce__123_1", "cat": "kernel", "ph": "X", "ts": 1130, "dur": 120, "pid": 1, "tid": 9, "args": {"stream": 9}},
+    {"name": "HcomSend", "cat": "communication", "ph": "X", "ts": 1260, "dur": 10, "pid": 1, "tid": 2, "args": {"stream": 10}},
+    {"name": "HcomReceive", "cat": "communication", "ph": "X", "ts": 1275, "dur": 12, "pid": 1, "tid": 2, "args": {"stream": 10}},
+    {"name": "UnknownKernel", "cat": "Kernel", "ph": "X", "ts": 1300, "dur": 10, "pid": 1, "tid": 5},
+    {"name": "no_time", "cat": "kernel", "ph": "X", "pid": 1, "tid": 1, "args": {"stream": 7}}
+  ]
+}
