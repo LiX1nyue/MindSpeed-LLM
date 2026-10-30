@@ -289,9 +289,27 @@ static void link(Node *a,Node *b,const string &why) {
     if(a && b && a!=b) evidence.push_back({a,b,why});
 }
 
-static void local_dependencies(RankTrace &rt, ostream &diag) {
+static string attribute(const Json &e, const string &key) {
+    const Json *args = field(e, "args");
+    return text(field(e, key), args ? text(field(*args, key)) : "");
+}
+
+static string context_of(const Json &e) {
+    string context = attribute(e, "context_id");
+    return context.empty() ? attribute(e, "Context Id") : context;
+}
+
+static void local_dependencies(RankTrace &rt, ostream &diag, double window, bool infer) {
+    const auto &events=events_of(rt.trace)->array;
     map<string,vector<Node *>> tracks;
+    map<pair<long long,long long>,vector<Node *>> display_tracks;
+    map<string,vector<Node *>> connections;
     for(Node *n:rt.local) tracks[n->track].push_back(n);
+    for(Node *n:rt.local) {
+        display_tracks[{n->pid,n->tid}].push_back(n);
+        string id=attribute(events[n->source],"connection_id");
+        if(!id.empty()) connections[id].push_back(n);
+    }
     for(auto &kv:tracks) {
         auto &v=kv.second;
         sort(v.begin(),v.end(),[](Node *a,Node *b){return a->ts!=b->ts?a->ts<b->ts:a->source<b->source;});
@@ -301,18 +319,71 @@ static void local_dependencies(RankTrace &rt, ostream &diag) {
                 link(v[i-1],v[i],"same_stream");
         }
     }
-    const auto &events=events_of(rt.trace)->array;
+    for(auto &kv:display_tracks)
+        sort(kv.second.begin(),kv.second.end(),[](Node *a,Node *b){return a->ts<b->ts;});
+    // A connection identifies ownership, NOT a finish-before-start edge. Keep
+    // launch and microstep events as evidence even though they are not public nodes.
+    auto owner=[&](size_t index)->Node * {
+        const Json &e=events[index];
+        string id=attribute(e,"connection_id");
+        if(id.empty() || !connections.count(id)) return nullptr;
+        double t=number(field(e,"ts"),-1), end=t+number(field(e,"dur"));
+        Node *result=nullptr;
+        for(Node *n:connections[id]) {
+            string context=context_of(e), nc=context_of(events[n->source]);
+            if(!context.empty()&&!nc.empty()&&context!=nc) continue;
+            string group=attribute(e,"group_name");
+            if(!group.empty()&&!n->group.empty()&&group!=n->group) continue;
+            if(t<0 || end<n->ts-window || t>n->ts+n->dur+window) continue;
+            if(result && result!=n) {
+                diag<<"rank="<<rt.rank<<" ambiguous_connection event="<<index<<"\n";
+                return nullptr;
+            }
+            result=n;
+        }
+        return result;
+    };
     auto locate=[&](size_t index,bool before)->Node * {
         auto exact=rt.event_nodes.find(index); if(exact!=rt.event_nodes.end()) return exact->second;
         const Json &e=events[index]; double t=number(field(e,"ts"),-1);
-        auto it=tracks.find(event_track(e)); if(it==tracks.end()||t<0) return nullptr;
+        if(Node *n=owner(index)) return n;
+        if(t<0) return nullptr;
+        // Flow markers often omit stream args. Resolve through their display
+        // track without treating that track as a serial device stream.
+        const vector<Node *> *nodes=nullptr;
+        auto it=tracks.find(event_track(e));
+        if(it!=tracks.end()) nodes=&it->second;
+        else {
+            auto dt=display_tracks.find({integer(field(e,"pid")),integer(field(e,"tid"))});
+            if(dt!=display_tracks.end()) nodes=&dt->second;
+        }
+        if(!nodes) return nullptr;
         Node *found=nullptr;
-        for(Node *n:it->second) {
+        for(Node *n:*nodes) {
             if(n->ts<=t && t<n->ts+n->dur) return n;
-            if(before && n->ts+n->dur<=t) found=n;
-            if(!before && n->ts>=t) return n;
+            if(before && n->ts+n->dur<=t && t-(n->ts+n->dur)<=window) found=n;
+            if(!before && n->ts>=t) return n->ts-t<=window?n:nullptr;
         }
         return found;
+    };
+    auto completion_link=[&](size_t start,size_t finish,const string &reason) {
+        Node *a=locate(start,true), *b=locate(finish,false);
+        if(!a||!b) {
+            diag<<"rank="<<rt.rank<<" unresolved_dependency reason="<<reason
+                <<" events="<<start<<","<<finish<<"\n";
+            return;
+        }
+        if(a==b) return;
+        // Partial collective progress and host launches must not become whole
+        // operation completion dependencies. Zero tolerance: timestamps are us.
+        if(a->ts+a->dur>b->ts) {
+            diag<<"rank="<<rt.rank<<" noncompletion_dependency reason="<<reason
+                <<" events="<<start<<","<<finish<<"\n";
+            return;
+        }
+        link(a,b,reason);
+        diag<<"rank="<<rt.rank<<" dependency_evidence reason="<<reason
+            <<" events="<<start<<","<<finish<<" nodes="<<a->source<<","<<b->source<<"\n";
     };
     vector<size_t> order;
     for(size_t i=0;i<events.size();++i) if(number(field(events[i],"ts"),-1)>=0) order.push_back(i);
@@ -323,44 +394,107 @@ static void local_dependencies(RankTrace &rt, ostream &diag) {
         if(ph!="s" && ph!="t" && ph!="f") continue;
         string id=text(field(e,"id"),text(field(e,"bind_id")));
         if(id.empty()) { diag<<"rank="<<rt.rank<<" unresolved flow event="<<i<<" missing id\n"; continue; }
-        string key=text(field(e,"cat"))+":"+text(field(e,"name"))+":"+text(field(e,"scope"))+":"+id;
+        // name is descriptive and may differ between flow endpoints.
+        string key=quote(text(field(e,"cat")))+quote(text(field(e,"scope")))+
+                   quote(text(field(e,"bid")))+quote(id);
         if(ph=="s") {
             if(pending.count(key)) diag<<"rank="<<rt.rank<<" reused active flow id="<<quote(key)<<"\n";
             pending[key]=i;
         } else if(pending.count(key)) {
-            Node *a=locate(pending[key],true),*b=locate(i,false);
-            if(a&&b) link(a,b,"flow");
-            else diag<<"rank="<<rt.rank<<" unresolved flow id="<<quote(key)<<"\n";
+            string name=lower(text(field(e,"name")));
+            string start_name=lower(text(field(events[pending[key]],"name")));
+            bool launch=name=="hostop"||name=="hostopdevice"||start_name=="hostop"||start_name=="hostopdevice";
+            if(launch) diag<<"rank="<<rt.rank<<" launch_flow events="<<pending[key]<<","<<i
+                           <<" (ownership only; not a completion edge)\n";
+            else completion_link(pending[key],i,"flow");
             if(ph=="f") pending.erase(key); else pending[key]=i;
         } else diag<<"rank="<<rt.rank<<" flow missing start event="<<i<<"\n";
     }
     for(const auto &kv:pending) diag<<"rank="<<rt.rank<<" flow missing finish id="<<quote(kv.first)<<"\n";
-    // EVENT IDs are local to rank/device context. Notify without sufficient peer/group
-    // scope is deliberately reported rather than paired by a bare notify_id.
+    // IDs are rank-local and reusable. Match within a bounded time window and
+    // reject ambiguous active records instead of silently taking the last one.
     map<string,size_t> records;
+    set<string> ambiguous_records;
     for(size_t i:order) {
         const Json &e=events[i]; const Json *a=field(e,"args"); if(!a) continue;
         string task=task_type(e,a), name=lower(text(field(e,"name")));
-        bool record=task=="EVENT_RECORD", wait=task=="EVENT_WAIT";
-        if(!record&&!wait) {
-            if(name.find("notify_record")!=string::npos||name.find("notify_wait")!=string::npos)
-                diag<<"rank="<<rt.rank<<" unresolved_notify event="<<i<<" (requires group/peer context)\n";
-            continue;
-        }
-        string id=text(field(*a,"event_id"),text(field(*a,"Event Id")));
-        string context=text(field(*a,"context_id"),text(field(*a,"Context Id")));
+        bool notify=name.find("notify_record")!=string::npos||name.find("notify_wait")!=string::npos;
+        bool record=task=="EVENT_RECORD"||name.find("notify_record")!=string::npos;
+        bool wait=task=="EVENT_WAIT"||name.find("notify_wait")!=string::npos;
+        if(!record&&!wait) continue;
+        string id=attribute(e,notify?"notify_id":"event_id");
+        if(id.empty()) id=attribute(e,"Event Id");
+        if(id.empty()&&notify) id=attribute(e,"event_id");
+        string context=context_of(e);
         if(id.empty()||context.empty()) {diag<<"rank="<<rt.rank<<" unresolved_event_sync event="<<i<<"\n";continue;}
-        string key=context+":"+id;
-        if(record) records[key]=i;
-        else if(records.count(key)) link(locate(records[key],true),locate(i,false),"event_record_wait");
+        string key=(notify?"notify":"event")+quote(context)+quote(id);
+        if(notify) {
+            string group=attribute(e,"group_name"), src=attribute(e,"src_rank"), dst=attribute(e,"dst_rank");
+            if(group.empty()||src.empty()||dst.empty()) {
+                diag<<"rank="<<rt.rank<<" unresolved_notify event="<<i<<" missing group/peer context\n";
+                continue;
+            }
+            key+=quote(group)+quote(src)+quote(dst);
+        }
+        if(record) {
+            if(records.count(key) && number(field(e,"ts"))-number(field(events[records[key]],"ts"))<=window)
+                ambiguous_records.insert(key);
+            else ambiguous_records.erase(key);
+            records[key]=i;
+        } else if(records.count(key)) {
+            size_t start=records[key];
+            if(!ambiguous_records.count(key) && number(field(e,"ts"))-number(field(events[start],"ts"))<=window)
+                completion_link(start,i,notify?"notify_record_wait":"event_record_wait");
+            else diag<<"rank="<<rt.rank<<" unresolved_event_sync event="<<i<<" ambiguous or expired record\n";
+            records.erase(key);
+            ambiguous_records.erase(key);
+        } else diag<<"rank="<<rt.rank<<" unresolved_event_sync event="<<i<<" missing record\n";
+    }
+    if(infer) {
+        // Only infer within a demonstrated stream/launch chain, never select the
+        // globally nearest compute. Connection ownership anchors hidden waits.
+        for(size_t i:order) {
+            const Json &e=events[i];
+            Node *comm=owner(i);
+            if(!comm||comm->type==Node::COMPUTE||rt.event_nodes.count(i)) continue;
+            auto track=tracks.find(event_track(e));
+            if(track==tracks.end()||track->first.find("device:")!=0) continue;
+            string task=task_type(e,field(e,"args")), name=lower(text(field(e,"name")));
+            bool wait=task=="EVENT_WAIT"||name.find("notify_wait")!=string::npos;
+            double t=number(field(e,"ts")), end=t+number(field(e,"dur"));
+            Node *candidate=nullptr;
+            for(Node *n:track->second) {
+                if(n==comm) continue;
+                if(wait && n->ts>=max(end,comm->ts+comm->dur) && n->ts-end<=window) { candidate=n; break; }
+                if(!wait && n->type==Node::COMPUTE && n->ts+n->dur<=t && t-(n->ts+n->dur)<=window)
+                    candidate=n;
+            }
+            if(candidate) {
+                if(wait) link(comm,candidate,"inferred_collective_completion");
+                else if(candidate->ts+candidate->dur<=comm->ts)
+                    link(candidate,comm,"inferred_compute_to_communication");
+                diag<<"rank="<<rt.rank<<" inferred_anchor event="<<i<<" communication="<<comm->source<<"\n";
+            }
+        }
     }
     for(Node *n:rt.local) if(n->type==Node::P2P)
         diag<<"rank="<<rt.rank<<" unresolved_p2p source="<<n->source<<" name="<<quote(n->name)<<" (peer matching unavailable)\n";
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) { cerr << "usage: " << argv[0] << " <profile_bundle> <dag_output>\n"; return 2; }
+    if (argc < 3) { cerr << "usage: " << argv[0] << " <profile_bundle> <dag_output> [--infer-dependencies] [--dependency-window-us N]\n"; return 2; }
     try {
+        bool infer=false;
+        double window=1000;
+        for(int i=3;i<argc;++i) {
+            string arg=argv[i];
+            if(arg=="--infer-dependencies") infer=true;
+            else if(arg=="--dependency-window-us" && i+1<argc) {
+                string value=argv[++i]; char *end=nullptr;
+                window=strtod(value.c_str(),&end);
+                if(value.empty()||*end||!isfinite(window)||window<=0) throw runtime_error("invalid dependency window");
+            } else { cerr<<"unknown or incomplete option: "<<arg<<"\n"; return 2; }
+        }
         string root = argv[1], output = argv[2]; vector<RankTrace> traces; deque<Node> storage;
         map<string, vector<Node *> > collective_by_name;
         ofstream diag((output+".diagnostics.txt").c_str());
@@ -409,7 +543,7 @@ int main(int argc, char **argv) {
                 }
                 if(!rt.local.empty() && rt.local.back()->source==index) rt.event_nodes[index]=rt.local.back();
             }
-            local_dependencies(rt,diag);
+            local_dependencies(rt,diag,window,infer);
             // Release raw JSON before reading the next rank; nodes have stable deque addresses.
             rt.trace=Json(); rt.metadata=Json();
             traces.push_back(std::move(rt));
@@ -458,6 +592,8 @@ int main(int argc, char **argv) {
             add_edge(a,b);
             if(a!=b) diag<<"edge "<<a->id<<" -> "<<b->id<<" reason="<<e.reason<<" rank="<<e.src->rank<<" sources="<<e.src->source<<","<<e.dst->source<<"\n";
         }
+        for(Node *n:all) if(n->type==Node::COLLECTIVE && n->children.empty())
+            diag<<"collective_without_successor id="<<n->id<<" name="<<quote(n->name)<<"\n";
         // Validate the resulting graph is acyclic.
         map<int, int> indegree; for (Node *n : all) indegree[n->id] = 0;
         for (Node *n : all) for (int c : n->children) ++indegree[c];

@@ -9,7 +9,8 @@
 - 从每个 rank 的 `view_trace.json` 中提取计算、集合通信和 P2P 事件；
 - 根据 `profiler_metadata.json` 校验 rank 和 `world_size`；
 - 在同一设备 stream 上建立有时间先后的依赖；
-- 使用 trace 中的 flow、`EVENT_RECORD/EVENT_WAIT` 建立可确认的依赖；
+- 使用 trace 中的 flow、`EVENT_RECORD/EVENT_WAIT` 和具备上下文的 Notify 建立可确认的依赖；
+- 可选地根据 rank-local 通信完成记录建立受限的推断边；
 - 将各 rank 中同名的集合通信事件合并为一个 collective 节点；
 - 输出文本格式 DAG，并检查结果是否存在环。
 
@@ -89,7 +90,7 @@ g++ -O2 -Wall -Wextra export_multi_dag.cpp -o export_multi_dag
 命令格式：
 
 ```bash
-<exporter> <profile_bundle> <dag_output>
+<exporter> <profile_bundle> <dag_output> [--infer-dependencies] [--dependency-window-us N]
 ```
 
 示例：
@@ -98,6 +99,16 @@ g++ -O2 -Wall -Wextra export_multi_dag.cpp -o export_multi_dag
 /tmp/opencode/export_multi_dag \
     /path/to/profile_bundle \
     /path/to/output/multi_rank_dag.txt
+```
+
+默认只输出有明确 trace 证据的边。若需要在缺少完整等待事件时恢复通信完成后的候选后继，可显式开启受限推断：
+
+```bash
+/tmp/opencode/export_multi_dag \
+    /path/to/profile_bundle \
+    /path/to/output/multi_rank_dag.txt \
+    --infer-dependencies \
+    --dependency-window-us 1000
 ```
 
 程序会同时生成两个文件：
@@ -170,6 +181,8 @@ id=... type=COLLECTIVE name="..." comm_type=ALL_REDUCE participants=[...] ts=...
 - `unresolved_group`：集合通信找不到可验证的 group 成员；
 - `unresolved_p2p`：发现 P2P，但没有进行跨 rank peer 匹配；
 - `unresolved_notify`、`unresolved_event_sync`：同步事件缺少足够的上下文；
+- `collective_without_successor`：集合通信没有恢复出边，应检查完成同步证据或使用受限推断；
+- `inferred_*`：由 `--infer-dependencies` 产生的推断关系；
 - `flow missing ...`：flow 事件不完整或无法映射到公开节点；
 - `edge ... reason=...`：输出边及其来源，例如 `same_stream`、`flow`、`event_record_wait`。
 
@@ -179,11 +192,13 @@ id=... type=COLLECTIVE name="..." comm_type=ALL_REDUCE participants=[...] ts=...
 
 1. **集合通信通过完整事件名匹配。** 当前实现将同名 collective 视为同一个跨 rank 操作，即 `participant_source=exact_name`。如果不同 rank 的事件名带有 rank、序号或其他不一致后缀，可能无法合并。
 2. **不是通用的跨 rank collective matcher。** 程序不会仅凭时间接近、`connection_id`、local sequence 或 correlation 自动匹配集合通信。
-3. **只建立有证据的依赖。** 不会因为两个事件时间相邻就建立跨 stream 或跨 rank 边，也不会把所有事件按全局时间串行化。
+3. **默认只建立有证据的依赖。** 不会因为两个事件时间相邻就建立跨 stream 或跨 rank 边，也不会把所有事件按全局时间串行化。`--infer-dependencies` 只启用有 rank-local 完成时间和有限窗口约束的推断边。
 4. **P2P 仅保留节点。** 当前版本会报告未解析的 P2P 依赖，不会根据 send/recv 名称自动构造跨 rank 边。
 5. **当前固定为 8 rank。** 如果要支持其他 world size，需要修改源码中的 rank 循环、metadata 校验和 group 成员范围检查。
 6. **通信字节数可能是估算值。** 当 trace 只有 `count` 和 `data_type` 时，程序使用 dtype 大小估算 bytes；未知 dtype 时不会猜测字节数。
 7. **`communication.json` 未参与计算。** 输出中的通信时间来自 trace 事件；它不等同于真实网络 transit time，也不替代通信库提供的带宽数据。
+
+完整的节点类型、证据优先级、集合通信完成边和推断规则见 [`export_multi_dag_edge_model.md`](export_multi_dag_edge_model.md)。
 
 因此，当前输出应作为**保守的、可审计的 DAG 基线**。在服务器上拿到新的 profiler schema 后，应先抽样确认字段，再决定是否扩展匹配规则。
 
