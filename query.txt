@@ -1,0 +1,126 @@
+# 8 卡通算 DAG 构建问题
+
+## Trace 文件与设备归属
+
+1. 当前共有多少个 `trace_view.json` 文件？每个文件对应哪个 rank、device 或卡号？
+
+2. 这些 trace 是否来自同一次训练、同一个 profiling step、同一个 host 和同一个时间区间？各文件的时间戳是否使用同一时间基准？
+
+3. 每个 trace 的顶层元数据中是否包含 rank、world size、device id、卡号或并行组信息？这些字段的具体名称和结构是什么？
+
+4. 事件本身是否包含明确的 rank、device、card、device_id 或 global_rank 字段？如果没有，能否可靠地使用 trace 文件所属 rank 作为事件的卡号？
+
+## 计算事件
+
+5. 如何从事件中识别真正的 NPU 计算任务？需要排除哪些 CPU 算子、Memcpy、Notify、通信微步骤或重复底层 kernel？
+
+6. 计算事件的名称、开始时间和持续时间字段分别是什么？计算耗时是否应使用 `dur`？
+
+7. 每个计算事件能否确定执行卡号？如果不能，是否可以按所属 trace 的 rank 赋值？
+
+8. 是否存在同一个计算任务在多个 trace 中重复记录的情况？如果存在，应使用什么字段去重？
+
+## 集合通信事件
+
+9. 如何识别集合通信大事件？实际使用哪些名称、类别或字段区分 `ALL_REDUCE`、`ALL_GATHER`、`REDUCE_SCATTER`、`ALL_TO_ALL` 和 `BROADCAST`？
+
+10. 集合通信事件中，通信类型、通信组、参与卡列表、数据类型、元素数量、字节数和带宽分别对应哪些字段？
+
+11. 如果事件没有直接提供参与卡列表，能否根据 rank、通信组、并行配置或其他元数据准确恢复参与卡集合？
+
+12. 同一个集合通信在不同卡的 trace 中是否各有一条记录？这些记录如何通过名称、序号、correlation、group_name、时间戳或其他唯一字段进行匹配？
+
+13. 一个跨卡集合通信应合并为一个节点并保存参与卡列表，还是保留每张卡各自的通信节点？
+
+14. 带宽是否由 trace 直接提供？如果需要计算，通信字节数和通信耗时分别来自哪些字段？最终输出是否只保留带宽而删除通信耗时？
+
+## DAG 依赖
+
+15. trace 中是否存在标准 flow 事件、Notify_Record、Notify_Wait、correlation、通信序号或其他显式依赖信息？这些字段如何配对？
+
+16. 如何确定计算到集合通信、集合通信到计算之间的跨卡依赖？是否存在明确的触发方和等待方信息？
+
+17. 在没有显式跨卡依赖时，是否允许依据同一个 collective 的多卡事件和各卡时间线推断依赖？如果允许，推断规则是什么？
+
+18. 同一卡内的计算任务是否应按时间顺序建立依赖？集合通信任务是否也需要按同一卡或同一通信组的出现顺序建立依赖？
+
+19. 是否需要保留 P2P Send/Recv 节点和依赖？如果目标只包含计算与集合通信，P2P 和通信微步骤应如何处理？
+
+20. 同一卡上是否存在重叠执行的计算或集合通信？如果存在，应以 stream、flow、notify 还是其他同步信息确定依赖，避免错误地按时间顺序连边？
+
+## 输出要求
+
+21. 最终 DAG 输出格式是什么：现有 `dag_output.txt` 文本格式、JSON、DOT、GraphML 或其他格式？
+
+22. 计算节点是否只需要保存 `node_id`、类型、卡号、算子名称和计算耗时？是否还需要保存时间戳、stream、进程号或线程号？
+
+23. 集合通信节点是否保存 `node_id`、类型、通信类型、参与卡列表和带宽？是否还需要保存名称、通信组、数据类型、元素数量或字节数？
+
+24. 边是否只保存源节点和目标节点，不保存通信耗时、时间戳或其他属性？
+
+25. DAG 是否必须严格无环、边去重，并验证所有节点的卡号和集合通信参与卡列表完整？遇到无法确认的字段时应报错，还是允许标记为未知？
+
+
+
+以下是图片中包含的文本内容的提取：
+
+关于 trace_decode/day1 下 8 卡 trace 的简要核对，回答如下（编号沿用原题）：
+
+trace.jsonview 顶层是事件数组，没有 rank/world_size/device 的顶层元数据对象，rank、world_size、并行组在统计目录的 profiler_metadata.json: distributed_args(rank, world_size, tensor_model_parallel_size, pipeline_model_parallel_size, data_parallel_size, context_parallel_size, expert_model_parallel_size), group_info(group_name, group_rank, group_global_rank), device_id 主要在 ASCEND_PROFILER_OUTPUT/step_trace_time.csv 的 device_id 列，PROF_/device_/目录及 device_*/info.json 的 DeviceInfo()[] 内，trace 内部只有 ph=M 的 process_labels (如 "NPU:1") 给出卡标签。
+
+事件的只有 ph=name/pid/tid/dur/cat/args/id/ts/pb，没有 rank、device、card、device_id、global_rank。通信微步骤的 args 里只有 src_rank/dst_rank。可以把 trace 文件所属 rank 作为事件的卡号：本数据中 rank=N 对应 NPU N、device_id=N (rank1=NPU 1, rank4=NPU 4)，不要用合成的 pid/tid 推断卡号。
+
+取 process_name=Ascend Hardware 且 ph=X 的事件：Task Type 只留 AI_CORE、AI_VECTOR_CORE、MIX_AIC、MIX_AIV。排除 Python/CANN/Communication/Overlap 分析进程，cat=cpu_op、name 以 hcom/Memcpy/Notify/Reduce_Inline 开头的记录，以及 Task Type 为 EVENT_RECORD、EVENT_WAIT、SDMA、SDMA_SQE、PCIE_DMA_SQE、Write Value、Notify_Wait、PROFILING_DISABLE 的记录。
+
+宏事件名，开始时间用 ts，持续时间用 dur（微秒），ts 是绝对 Unix epoch 微秒，可能是字符串但应转成数字。计算耗时使用 NPU 硬件事件的 dur，不要用 CPU/CANN 层的同名 launch 事件耗时。
+
+单个计算事件不能确定卡号，按事件所属的 trace 的 rank/device_id 赋值即可；对本地数据而言，通信大事件的参与者要另查 group 元数据，不能照事件自身字段。
+
+单个 trace 内没有发齐全部 8 张卡的 kernel（实测重叠 0）：重叠主要是 CPU/CANN/Adm 与 NPU kernel 的多层记录，保留 Ascend Hardware 一层即可。不同 rank 上的同名 kernel 是各自独立记录，不能按 name 直接跨文件合并；划分用 rank、Physic Stream Id、task Id、ts、name)，按目录 trace_decode/day1 且 day1 rank0 三份 trace 是一份文件的副本，按 hash 去重。
+
+集合通信大事件：process_name=Communication、ph=X、name 以 hcom、host 开头；这类事件的 cat 为空，不能按 cat 识别。
+宏名称/name、name=hcom_reduce、hcom_allGather、hcom_reduceScatter、hcom_alltoAll(v)、hcom_broadcast、hcom_send/hcom_receive 属于 P2P，不算集合通信；Pipeline 下的 Memcpy、Reduce_Inline、Notify_Record、Notify_Wait 是微步骤，不算大事件。
+
+通信类型：name 前缀。
+通信大事件元数据在 info.json 的 thread name (Group group_name, N Communication) ，再用 profiler_metadata.json 的 parallel_group_info 翻译成通信名。
+数据类型：args.data_type；元素数量：args.count；字节数：bytes count * dtype 字节数（大事件未直接给 size）。
+带宽：大事件没有：communication.json 的 Communication Bandwidth Info- HCCS/SDMA/ROMA：里有 Transit Size(MB)/Transit Time(ns)/Bandwidth(GB/s)。
+args.alg_type、connection_id、relay、retry。
+
+能复用：用 trace 目录的 profiler_metadata.json: group_name_N = parallel_group_info.group_name、N.global_ranks；先按该 rank 的映射表一版 dp/cp/mp/pp/default_group 等逻辑组。
+只靠 trace 文件本身不够，因为 group_name 是 rank-local（同一逻辑组在不同 rank 可能叫 group_name_17 或 group_name_16）。
+PP 的 send/recv 还可结合微步骤 args 的 src_rank/dst_rank 判断配对，但这不能完全替代通信参与者列表。
+
+是的，每个参与 rank 各有一条通信大事件，没有全局唯一匹配字段：
+correlation 不在集合通信大事件里；connection_id 是 rank-local（实测 114 对同名且时间最近的通信中，0 对 connection_id 相等）；name 中的序号也可能是 rank-local，可能重名。
+匹配用（逻辑组、通信类型、count）+ 时间相近区间重叠：实测中间耗时约 0.35ms，最大约 61ms；name 可作辅助，不要用 connection_id 或 correlation 跨 rank 匹配。
+
+建议合并成一个跨卡集合通信节点：participants 保存 global_ranks，start=min(所有 rank 的 ts)，end=max(所有 rank 的 ts+dur)，并把每个 rank 的原始事件/耗时保留为节点的子记录。
+最终 8 卡 DAG 不应保留 8 个重复的 collective 节点；只有做单卡时间线时才保留每卡节点。
+
+大事件无直接传输时长。字节数 = count * dtype 字节数（仅当 args 内 "size" 存在），通信耗时用 dur；带宽 = 字节数 / 耗时。
+优先用 communication.json 的 Transit Size/Transit Time 计算有效带宽，Elapsed Time 包含等待。
+最终输出同层间为 comm_time 和 bandwidth，不要只写带宽，否则无法区分“等待时间”和“真实传输”。
+
+有直接流事件：followed_by，hostOp、HostOpDevice、sync_task_queue，按 id（或 bid,id）配对。
+HCCL 还有 Notify_Record/Notify_Wait 以及事件 EVENT_RECORD/EVENT_WAIT。
+Notify 的 notify_id 不能直接跨组配对（实测交叉概率为 0）；需结合 src_rank/dst_rank、stream/task/context、connection_id 和时间窗口。
+correlation_id 只用于 enqueue/dequeue，connection_id 只保证本卡 launch->hcom/kernel 的链路。
+
+本卡的触发明确：CANN 的 Node@launch (item_id=...) 与 hcom 大事件、通信微步骤共享 connection_id，可按 stream/连接链路“计算->launch->collective”边。跨卡没有形成建/等待/collective 作为同步点，以节点中 backoff 作为完成时间，再连到参与 rank 上其最后一个依赖它的计算节点。
+Notify 的 src_rank/dst_rank 只说明对端，不等于逻辑与数据流。
+
+允许推断，但标注 inferred，规则：
+先按 Q12 合并同一 collective；
+每个参与 rank 上，把该 collective 之前 stream/launch 链的最后一个计算节点连入；
+collective 完成（end）后，把该 rank 上第一个等待或依赖它的计算节点连出；
+没有依赖证据时，只用本卡顺序/区间重叠附近，不能仅按全局 ts 排序。
+
+同一计算图跨 Physic Stream Id（或 tid）分 stream，内部按 ts 排序；跨 stream 只有在 flow/notify/event/task queue 同步时才连。
+集合通信同一逻辑组/rank 的出现顺序（按 name 中 seq）连；不同通信可并行，不能全按 ts 连成串。
+
+目前只合理：集合通信时，相邻节点会复制 P2P Send/Recv 和有向通信微步骤。
+但 PP 的 send/recv 事件确实有依赖，必须把 PP 接收端做成 compute-compute 的传递边（或保留为 hidden edge），不能直接丢弃；否则 PP stage 的依赖会断。
+
+部分rank中存在重叠。Communication 与 Computing 并行（用 pid/oid overlap>0.504；rank4 overlap>0）。数据按 event 归类，并按 EVENT_RECORD/EVENT_WAIT + task queue/connection_id 绑定。不能按 ts 全局排序。
+重叠段没有同步关系的计算任务应视为独立，优先调参；Overlap Analysis 只做重叠时长，不给依赖边。
