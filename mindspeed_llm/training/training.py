@@ -270,6 +270,43 @@ def is_profile_enabled():
     return False
 
 
+def chakra_dag_begin(args):
+    """安装 Chakra DAG 采集钩子。
+
+    单独包一层是为了让训练主流程的改动只有一行，并且把"可选功能失败不影响训练"
+    的策略集中到 ``mindspeed_llm.tools.chakra_dag.hooks`` 里。
+    """
+    try:
+        from mindspeed_llm.tools.chakra_dag import hooks as chakra_hooks
+    except ImportError:
+        return None
+    recorder = chakra_hooks.begin(args, rank=args.rank)
+    if recorder is not None and recorder.degraded:
+        print(f"[chakra-dag] rank {args.rank} 采集降级，原因: {recorder.notes()}")
+    return recorder
+
+
+def chakra_dag_end(args):
+    """卸下采集钩子并落盘采集记录。"""
+    try:
+        from mindspeed_llm.tools.chakra_dag import hooks as chakra_hooks
+    except ImportError:
+        return None
+    return chakra_hooks.end(args, rank=args.rank)
+
+
+def chakra_dag_export(args):
+    """起子进程补时长并写 Chakra 产物（仅 rank0）。"""
+    try:
+        from mindspeed_llm.tools.chakra_dag import hooks as chakra_hooks
+    except ImportError:
+        return None
+    result = chakra_hooks.export(args)
+    if result and not result.get("ok", True):
+        print(f"[chakra-dag] 导出未成功: {result.get('error') or result.get('stderr_tail', '')}")
+    return result
+
+
 def get_profiler():
     args = get_args()
     if args.profile_level == 'level_none':
@@ -697,6 +734,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         prof = get_profiler()
         prof.start()
 
+    # --- Chakra 通算 DAG 采集：挂钩子，随 profiling 一起开 ---
+    # 必须在 prof.start() 之后、训练循环之前，保证结构记录覆盖整个采集窗口。
+    chakra_dag_begin(args)
+
     start_iteration = iteration
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
@@ -915,8 +956,15 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             from mindio_ttp.framework_ttp import tft_pause_train
             tft_pause_train(iteration)
 
+    # 采集先落盘，再让 profiler 收尾：
+    # 记录不应覆盖 profiler 自己的 FLUSH 与导出阶段。
+    chakra_dag_end(args)
+
     if is_profile_enabled():
         prof.stop()
+
+    # prof.stop() 之后 trace_view.json 才存在，此时才能补时长并写 .et。
+    chakra_dag_export(args)
 
     one_logger_utils.track_e2e_metrics()
 

@@ -105,6 +105,13 @@ class Trainer:
             profile_record_shapes=args.profile_record_shapes,
             profile_save_path=args.profile_save_path,
             current_rank=current_rank,
+            chakra_dag_export=getattr(args, "chakra_dag_export", False),
+            chakra_dag_output_path=getattr(args, "chakra_dag_output_path", None),
+            chakra_dag_format=getattr(args, "chakra_dag_format", "both"),
+            chakra_dag_fused_mode=getattr(args, "chakra_dag_fused_mode", "split-estimate"),
+            chakra_dag_bandwidth_gbps=getattr(args, "chakra_dag_bandwidth_gbps", None),
+            chakra_dag_inplace=getattr(args, "chakra_dag_inplace", False),
+            chakra_dag_timeout_seconds=getattr(args, "chakra_dag_timeout_seconds", 1800.0),
         )
         self.profiler_manager = ProfilerManager(prof_config)
         self.msprobe_manager = MsProbeManager(

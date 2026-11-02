@@ -28,6 +28,26 @@ class ProfilingFeature(MindSpeedFeature):
                                          help='profiling with cpu info')
         group.add_argument('--profile-save-path', type=str, default='./profile_dir',
                                          help='path to save profiling files')
+        # --- Chakra 通算 DAG 导出 ---
+        # 采集结构（运行时钩子）+ 补时长（profiling trace）→ Chakra execution trace。
+        group.add_argument('--chakra-dag-export', action='store_true',
+                                         help='export a compute/communication DAG in Chakra format after profiling')
+        group.add_argument('--chakra-dag-output-path', type=str, default=None,
+                                         help='output directory for DAG artifacts; default <profile-save-path>/chakra_dag')
+        group.add_argument('--chakra-dag-format', type=str, default='both',
+                                         choices=['protobuf', 'json', 'both'],
+                                         help="DAG output format; 'json' does not require the chakra package")
+        group.add_argument('--chakra-dag-fused-mode', type=str, default='split-estimate',
+                                         choices=['split-measured', 'split-estimate', 'merged'],
+                                         help='how to split the measured duration of a fused MC2/CoC operator')
+        group.add_argument('--chakra-dag-bandwidth-gbps', type=float, default=None,
+                                         help='bandwidth in GB/s used to estimate the comm part of a fused operator')
+        group.add_argument('--chakra-dag-inplace', action='store_true',
+                                         help='run DAG export in the current process instead of a subprocess (debug)')
+        group.add_argument('--chakra-dag-timeout-seconds', type=float, default=1800.0,
+                                         help='timeout for the DAG export subprocess')
+        group.add_argument('--chakra-dag-max-events', type=int, default=2000000,
+                                         help='upper bound on captured events per rank')
 
     def validate_args(self, args):
         super().validate_args(args)

@@ -687,6 +687,37 @@ class TrainingArguments:
     profile_save_path: str = field(
         default="./profile", metadata={"help": "Directory to save profiling traces (TensorBoard format)."}
     )
+    # --- Chakra 通算 DAG 导出 ---
+    chakra_dag_export: bool = field(
+        default=False,
+        metadata={"help": "Export a compute/communication DAG in Chakra format when profiling stops."},
+    )
+    chakra_dag_output_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Output directory for Chakra DAG artifacts. Defaults to <profile_save_path>/chakra_dag."},
+    )
+    chakra_dag_format: str = field(
+        default="both",
+        metadata={"help": "DAG output format: 'protobuf', 'json', or 'both'. 'json' does not require Chakra."},
+    )
+    chakra_dag_fused_mode: str = field(
+        default="split-estimate",
+        metadata={
+            "help": "How to split a fused (MC2/CoC) operator's measured duration: "
+            "'split-measured', 'split-estimate', or 'merged'."
+        },
+    )
+    chakra_dag_bandwidth_gbps: Optional[float] = field(
+        default=None,
+        metadata={"help": "Bandwidth in GB/s used to estimate the comm part of a fused operator."},
+    )
+    chakra_dag_inplace: bool = field(
+        default=False,
+        metadata={"help": "Run DAG export in the current process instead of a subprocess (debugging only)."},
+    )
+    chakra_dag_timeout_seconds: float = field(
+        default=1800.0, metadata={"help": "Timeout in seconds for the DAG export subprocess."}
+    )
     # --- msProbe precision data collection ---
     msprobe: bool = field(default=False, metadata={"help": "Enable msProbe precision data collection."})
     msprobe_config_path: Optional[str] = field(

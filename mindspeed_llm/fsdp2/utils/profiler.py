@@ -2,6 +2,7 @@
 import os
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional, List
 from dataclasses import dataclass
 
@@ -33,9 +34,24 @@ class ProfilerConfig:
     profile_save_path: str = "./profile"
     current_rank: int = 0
 
+    # --- Chakra 通算 DAG 导出 ---
+    # 打开后，profile 停止时会额外产出 events_rank*.json / rank*.et / multi_rank_dag.json。
+    chakra_dag_export: bool = False
+    chakra_dag_output_path: Optional[str] = None
+    chakra_dag_format: str = "both"
+    chakra_dag_fused_mode: str = "split-estimate"
+    chakra_dag_bandwidth_gbps: Optional[float] = None
+    chakra_dag_inplace: bool = False
+    chakra_dag_timeout_seconds: float = 1800
+    chakra_dag_source: str = "auto"
+    chakra_dag_ranks: Optional[List[int]] = None
+    chakra_dag_max_events: int = 2_000_000
+
     def __post_init__(self):
         if self.profile_ranks is None:
             self.profile_ranks = [-1]
+        if self.chakra_dag_ranks is None:
+            self.chakra_dag_ranks = [-1]
 
     def is_profiling_rank(self) -> bool:
         if not self.enabled:
@@ -113,6 +129,33 @@ class ProfilerManager:
             experimental_config=experimental_config,
         )
 
+        # --- Chakra 通算 DAG 采集钩子 ---
+        # 与 profiler 同生命周期：install 在 profiler 启动前后均可，但必须早于训练循环。
+        self._chakra_hooks = None
+        self._chakra_args = None
+        if getattr(config, "chakra_dag_export", False):
+            try:
+                from mindspeed_llm.tools.chakra_dag import hooks as chakra_hooks
+
+                self._chakra_hooks = chakra_hooks
+                self._chakra_args = SimpleNamespace(
+                    chakra_dag_export=True,
+                    world_size=(torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1),
+                    rank=config.current_rank,
+                    profile_save_path=config.profile_save_path,
+                    chakra_dag_max_events=getattr(config, "chakra_dag_max_events", 2_000_000),
+                    chakra_dag_output_path=getattr(config, "chakra_dag_output_path", None),
+                    chakra_dag_format=getattr(config, "chakra_dag_format", "both"),
+                    chakra_dag_fused_mode=getattr(config, "chakra_dag_fused_mode", "split-estimate"),
+                    chakra_dag_bandwidth_gbps=getattr(config, "chakra_dag_bandwidth_gbps", None),
+                    chakra_dag_inplace=getattr(config, "chakra_dag_inplace", False),
+                    chakra_dag_timeout_seconds=getattr(config, "chakra_dag_timeout_seconds", 1800),
+                    chakra_dag_source=getattr(config, "chakra_dag_source", "auto"),
+                    chakra_dag_ranks=getattr(config, "chakra_dag_ranks", [-1]),
+                )
+            except ImportError:
+                self._chakra_hooks = None
+
         # --- Metadata ---
         try:
             world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -127,6 +170,9 @@ class ProfilerManager:
         if self.profiler is not None and not self._started:
             self.profiler.start()
             self._started = True
+            # 采集在 profiling 开始后立刻安装，保证窗口一致。
+            if self._chakra_hooks is not None and self._chakra_args is not None:
+                self._chakra_hooks.begin(self._chakra_args, rank=self._chakra_args.rank)
             logger.info_rank0(f"[RANK {self.config.current_rank}] Profiling started.")
 
     def step(self):
@@ -135,5 +181,11 @@ class ProfilerManager:
 
     def stop(self):
         if self.profiler is not None:
+            # 采集先落盘，再让 profiler 收尾导出。
+            if self._chakra_hooks is not None and self._chakra_args is not None:
+                self._chakra_hooks.end(self._chakra_args, rank=self._chakra_args.rank)
             self.profiler.stop()
+            # 此时 trace_view.json 才存在，可以补时长并写 .et。
+            if self._chakra_hooks is not None and self._chakra_args is not None:
+                self._chakra_hooks.export(self._chakra_args)
             logger.info_rank0(f"[RANK {self.config.current_rank}] Profiling stopped. Trace saved to {self.config.profile_save_path}")
