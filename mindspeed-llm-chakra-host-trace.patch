@@ -1,0 +1,137 @@
+diff --git a/mindspeed_llm/training/arguments.py b/mindspeed_llm/training/arguments.py
+--- a/mindspeed_llm/training/arguments.py
++++ b/mindspeed_llm/training/arguments.py
+@@ -86,2 +86,33 @@ def process_args_v2(parser):
+     MindSpeedFeaturesManager.register_features_args(parser)
++    chakra_group = parser.add_argument_group(title="Chakra host execution trace")
++    chakra_group.add_argument(
++        "--chakra-host-trace",
++        action="store_true",
++        help="Record a PyTorch ExecutionTraceObserver host trace for Chakra.",
++    )
++    chakra_group.add_argument(
++        "--chakra-host-trace-dir",
++        type=str,
++        default="./chakra_traces",
++        help="Directory for per-rank Chakra host traces.",
++    )
++    chakra_group.add_argument(
++        "--chakra-host-trace-start-step",
++        type=int,
++        default=0,
++        help="Inclusive global training step at which host tracing starts.",
++    )
++    chakra_group.add_argument(
++        "--chakra-host-trace-end-step",
++        type=int,
++        default=-1,
++        help="Exclusive global training step at which host tracing stops; -1 means until training ends.",
++    )
++    chakra_group.add_argument(
++        "--chakra-host-trace-ranks",
++        nargs="+",
++        type=int,
++        default=[-1],
++        help="Ranks to trace; -1 means all ranks.",
++    )
+     return parser
+diff --git a/mindspeed_llm/training/chakra_host_trace.py b/mindspeed_llm/training/chakra_host_trace.py
+new file mode 100644
+--- /dev/null
++++ b/mindspeed_llm/training/chakra_host_trace.py
+@@ -0,0 +1,64 @@
++"""Optional PyTorch execution trace collection for Chakra host traces."""
++
++import atexit
++import logging
++from pathlib import Path
++from typing import Any, Optional
++
++import torch
++
++
++class ChakraHostTraceManager:
++    """Own one per-process ExecutionTraceObserver and its training-step window."""
++
++    def __init__(self, args: Any) -> None:
++        self.enabled = bool(getattr(args, "chakra_host_trace", False))
++        self.rank = int(getattr(args, "rank", 0))
++        self.output_dir = Path(getattr(args, "chakra_host_trace_dir", "./chakra_traces"))
++        self.start_step = int(getattr(args, "chakra_host_trace_start_step", 0))
++        self.end_step = int(getattr(args, "chakra_host_trace_end_step", -1))
++        ranks = getattr(args, "chakra_host_trace_ranks", [-1])
++        self.ranks = {int(rank) for rank in ranks}
++        self.observer: Optional[torch.profiler.ExecutionTraceObserver] = None
++        self.output_path: Optional[Path] = None
++        self.started = False
++        self.stopped = False
++
++        if self.start_step < 0:
++            raise ValueError("chakra_host_trace_start_step must be >= 0")
++        if self.end_step != -1 and self.end_step <= self.start_step:
++            raise ValueError("chakra_host_trace_end_step must be greater than start step or -1")
++        if self.enabled and (-1 in self.ranks or self.rank in self.ranks):
++            self.output_dir.mkdir(parents=True, exist_ok=True)
++            self.output_path = self.output_dir / f"host.{self.rank}.json"
++            if self.output_path.exists():
++                raise FileExistsError(
++                    f"Refusing to overwrite existing Chakra host trace: {self.output_path}"
++                )
++            atexit.register(self.stop)
++
++    def _rank_enabled(self) -> bool:
++        return self.enabled and (-1 in self.ranks or self.rank in self.ranks)
++
++    def start_if_needed(self, step: int) -> None:
++        if not self._rank_enabled() or self.started or self.stopped or step < self.start_step:
++            return
++        assert self.output_path is not None
++        self.observer = torch.profiler.ExecutionTraceObserver()
++        self.observer.register_callback(str(self.output_path))
++        self.observer.start()
++        self.started = True
++        logging.info("Chakra host trace started: rank=%s path=%s", self.rank, self.output_path)
++
++    def stop_if_needed(self, step: int) -> None:
++        if self.started and self.end_step != -1 and step >= self.end_step:
++            self.stop()
++
++    def stop(self) -> None:
++        if self.observer is None or self.stopped:
++            return
++        self.observer.stop()
++        self.observer.unregister_callback()
++        self.stopped = True
++        logging.info("Chakra host trace saved: rank=%s path=%s", self.rank, self.output_path)
++
+diff --git a/mindspeed_llm/training/training.py b/mindspeed_llm/training/training.py
+--- a/mindspeed_llm/training/training.py
++++ b/mindspeed_llm/training/training.py
+@@ -30,2 +30,3 @@ import torch_npu
+ 
++from mindspeed_llm.training.chakra_host_trace import ChakraHostTraceManager
+ from megatron.core.transformer.moe.moe_utils import track_moe_metrics
+@@ -678,5 +678,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
+     if is_profile_enabled():
+         prof = get_profiler()
+         prof.start()
+ 
++    chakra_host_trace = ChakraHostTraceManager(args)
+     start_iteration = iteration
+@@ -692,3 +692,4 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
+ 
+     while iteration < args.train_iters:
++        chakra_host_trace.start_if_needed(iteration)
+         maybe_finalize_async_save(blocking=False)
+@@ -886,4 +886,5 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
+         if is_profile_enabled():
+             prof.step()
+ 
++        chakra_host_trace.stop_if_needed(iteration)
+         if args.enable_high_availability:
+@@ -893,4 +893,5 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
+     if is_profile_enabled():
+         prof.stop()
+ 
++    chakra_host_trace.stop()
+     one_logger_utils.track_e2e_metrics()
